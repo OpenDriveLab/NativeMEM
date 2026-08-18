@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 
 import jax
 import numpy as np
@@ -8,6 +9,36 @@ BATCH_AXIS = "batch"
 FSDP_AXIS = "fsdp"
 # In FSDP, we shard the data across both the batch and FSDP axes.
 DATA_AXIS = (BATCH_AXIS, FSDP_AXIS)
+
+
+def init_distributed() -> None:
+    """Join the multi-host JAX cluster when launched under a multi-node scheduler.
+
+    Must be called before any other JAX call, since it configures the backend. Launch exactly one
+    process per node (`srun --ntasks-per-node=1` / `torchrun --nproc_per_node=1`): a JAX process owns
+    all local GPUs, unlike torch DDP where one process owns one GPU. Single-node runs set none of
+    these variables and stay single-process.
+    """
+    if "SLURM_JOB_ID" in os.environ and int(os.environ.get("SLURM_NTASKS", "1")) > 1:
+        # JAX reads SLURM_PROCID / SLURM_NTASKS / SLURM_STEP_NODELIST itself.
+        jax.distributed.initialize()
+    elif int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        # torchrun / Kubernetes-style launchers.
+        jax.distributed.initialize(
+            coordinator_address=f"{os.environ['MASTER_ADDR']}:{os.environ.get('MASTER_PORT', '12355')}",
+            num_processes=int(os.environ["WORLD_SIZE"]),
+            process_id=int(os.environ["RANK"]),
+        )
+    else:
+        return
+
+    logging.info(
+        "JAX distributed initialized: process %d/%d, %d local devices, %d global devices",
+        jax.process_index(),
+        jax.process_count(),
+        jax.local_device_count(),
+        jax.device_count(),
+    )
 
 
 class _MeshState:

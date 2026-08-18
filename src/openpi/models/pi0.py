@@ -37,11 +37,23 @@ def make_attn_mask(input_mask, mask_ar):
       mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on
         it and false where it shares the same attention mask as the previous token.
     """
-    mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
-    cumsum = jnp.cumsum(mask_ar, axis=1)
-    attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
-    valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
-    return jnp.logical_and(attn_mask, valid_mask)
+    input_mask = jnp.asarray(input_mask, dtype=jnp.bool_)
+    mask_ar = jnp.asarray(mask_ar, dtype=jnp.bool_)
+
+    # Most call sites pass a static 1D autoregressive mask. Evaluate its cumsum at
+    # trace time before broadcasting so XLA does not spend time constant-folding a
+    # batch-sized reduce-window during compilation.
+    if mask_ar.ndim == 1:
+        with jax.ensure_compile_time_eval():
+            block_id = jnp.cumsum(mask_ar.astype(jnp.int32), axis=0)
+        block_id = jnp.broadcast_to(block_id[None, :], input_mask.shape)
+    else:
+        mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
+        block_id = jnp.cumsum(mask_ar.astype(jnp.int32), axis=1)
+
+    attn_mask = block_id[:, :, None] >= block_id[:, None, :]
+    valid_mask = input_mask[:, :, None] & input_mask[:, None, :]
+    return attn_mask & valid_mask
 
 
 @at.typecheck

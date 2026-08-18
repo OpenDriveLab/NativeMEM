@@ -8,6 +8,7 @@ from typing import Protocol
 
 from etils import epath
 import jax
+from jax.experimental import multihost_utils
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
@@ -24,9 +25,11 @@ def initialize_checkpoint_dir(
     resuming = False
     if checkpoint_dir.exists():
         if overwrite:
-            checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+            # Multi-host: only the primary process mutates the shared filesystem, otherwise a late
+            # process can wipe the directory after another has already written to it.
+            if jax.process_index() == 0:
+                checkpoint_dir.rmtree()
+                logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
         elif resume:
             resuming = True
         else:
@@ -35,7 +38,10 @@ def initialize_checkpoint_dir(
                 "to indicate how to handle it."
             )
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if jax.process_index() == 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # Hold every process here until the directory exists, so nobody reads it mid-wipe.
+    multihost_utils.sync_global_devices("initialize_checkpoint_dir")
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,

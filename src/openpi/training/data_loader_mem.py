@@ -145,9 +145,21 @@ def create_mem_torch_data_loader(
         else:
             local_batch_size = batch_size
     else:
+        # Multi-host: each process contributes a disjoint slice of the global batch. Without the sampler
+        # every host would replay the same samples, so the effective batch would be `process_count()`
+        # times smaller than requested.
         local_batch_size = batch_size // jax.process_count()
+        if jax.process_count() > 1:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=jax.process_count(),
+                rank=jax.process_index(),
+                shuffle=shuffle,
+                drop_last=True,
+                seed=seed,
+            )
 
-    logging.info("local_batch_size: %s", local_batch_size)
+    logging.info("local_batch_size: %s (global %s)", local_batch_size, batch_size)
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,

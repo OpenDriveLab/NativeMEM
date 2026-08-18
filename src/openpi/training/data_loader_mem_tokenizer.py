@@ -488,13 +488,30 @@ def create_mem_tokenizer_data_loader(
         )
     dataset = TransformedDataset(dataset, data_config.transforms)
 
+    # Multi-host: `config.batch_size` is the global batch. Each process contributes a disjoint slice of
+    # it, which `TorchDataLoader` assembles into the global array. Without the sampler every host would
+    # replay the same samples, so the effective batch would be `jax.process_count()` times smaller.
+    local_batch_size = config.batch_size // jax.process_count()
+    sampler = None
+    if jax.process_count() > 1:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=jax.process_count(),
+            rank=jax.process_index(),
+            shuffle=shuffle,
+            drop_last=True,
+            seed=config.seed,
+        )
+    logging.info("local_batch_size: %s (global %s)", local_batch_size, config.batch_size)
+
     return DataLoaderImpl(
         data_config,
         TorchDataLoader(
             dataset,
-            local_batch_size=config.batch_size,
+            local_batch_size=local_batch_size,
             sharding=sharding,
             shuffle=shuffle,
+            sampler=sampler,
             num_batches=num_batches,
             num_workers=config.num_workers,
             seed=config.seed,

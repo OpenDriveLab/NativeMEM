@@ -187,6 +187,9 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
+    # Must run before any other JAX call: it decides how many devices this process sees.
+    sharding.init_distributed()
+
     init_logging()
     logging.info(f"Running MemTokenizer pretraining on: {platform.node()}")
     logging.info(f"history_seq_len={config.model.history_seq_len}, action_horizon={config.model.action_horizon}")
@@ -194,6 +197,10 @@ def main(config: _config.TrainConfig):
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by device count {jax.device_count()}."
+        )
+    if config.batch_size % jax.process_count() != 0:
+        raise ValueError(
+            f"Batch size {config.batch_size} must be divisible by process count {jax.process_count()}."
         )
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
@@ -211,7 +218,8 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    # Only the primary process talks to wandb; the others would create duplicate runs.
+    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and jax.process_index() == 0)
 
     data_loader = create_mem_tokenizer_data_loader(config, sharding=data_sharding, shuffle=True)
     prefetch_size = 8 if config.num_workers > 0 else 1
@@ -239,6 +247,7 @@ def main(config: _config.TrainConfig):
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
+        disable=jax.process_index() != 0,
     )
 
     infos = []
@@ -251,7 +260,9 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={float(v):.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            # logging.info, not pbar.write: tqdm_loggable swallows write() so metrics never reach
+            # the cluster's captured stdout.
+            logging.info(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
 

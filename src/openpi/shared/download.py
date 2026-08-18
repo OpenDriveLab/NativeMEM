@@ -122,6 +122,10 @@ def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
 
 def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
     """Download a file from a remote filesystem to the local cache, and return the local path."""
+    if urllib.parse.urlparse(url).scheme == "gs":
+        # aiohttp ignores http_proxy/https_proxy env vars unless trust_env is set,
+        # so gcsfs otherwise bypasses an already-exported proxy.
+        kwargs.setdefault("session_kwargs", {"trust_env": True})
     fs, _ = fsspec.core.url_to_fs(url, **kwargs)
     info = fs.info(url)
     # Folders are represented by 0-byte objects with a trailing forward slash.

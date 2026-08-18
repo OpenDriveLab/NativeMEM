@@ -409,9 +409,9 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
-
+        # Multi-host: each process loads its own disjoint slice (see the sampler passed in by the
+        # loader factories) and `jax.make_array_from_process_local_data` below stitches the per-process
+        # slices into the global batch.
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
@@ -431,6 +431,7 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
+        self._sampler = sampler
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
@@ -451,7 +452,13 @@ class TorchDataLoader:
 
     def __iter__(self):
         num_items = 0
+        epoch = 0
         while True:
+            if self._sampler is not None and hasattr(self._sampler, "set_epoch"):
+                # DistributedSampler is deterministic given its epoch; without this every pass over the
+                # dataset would replay the exact same order.
+                self._sampler.set_epoch(epoch)
+            epoch += 1
             data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
