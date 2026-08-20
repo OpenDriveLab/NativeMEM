@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -176,7 +176,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+                "Make sure to run `scripts/compute_norm_stats.py <your-config>`."
             )
         norm_stats = data_config.norm_stats
 
@@ -204,7 +204,7 @@ def transform_iterable_dataset(
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+                "Make sure to run `scripts/compute_norm_stats.py <your-config>`."
             )
         norm_stats = data_config.norm_stats
 
@@ -319,9 +319,21 @@ def create_torch_data_loader(
         else:
             local_batch_size = batch_size
     else:
+        # Multi-host: each process contributes a disjoint slice of the global batch. Without the sampler
+        # every host would replay the same samples, so the effective batch would be `process_count()`
+        # times smaller than requested.
         local_batch_size = batch_size // jax.process_count()
+        if jax.process_count() > 1:
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=jax.process_count(),
+                rank=jax.process_index(),
+                shuffle=shuffle,
+                drop_last=True,
+                seed=seed,
+            )
 
-    logging.info(f"local_batch_size: {local_batch_size}")
+    logging.info(f"local_batch_size: {local_batch_size} (global {batch_size})")
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,

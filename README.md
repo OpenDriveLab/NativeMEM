@@ -34,12 +34,7 @@ Activate the environment before running any command in this README.
 ```bash
 source .venv/bin/activate
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
-```
-
-Set `HF_LEROBOT_HOME` if LeRobot datasets should be stored outside the default cache:
-
-```bash
-export HF_LEROBOT_HOME=/path/to/lerobot
+export HF_LEROBOT_HOME=$(pwd)/data
 ```
 
 ## Prepare the data

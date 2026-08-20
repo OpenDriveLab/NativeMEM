@@ -6,7 +6,7 @@ import numpy as np
 
 from openpi import transforms
 
-GripperType = Literal["trossen", "sim", "arx"]
+GripperType = Literal["trossen", "sim", "arx", "agilex"]
 
 
 def make_aloha_example() -> dict:
@@ -41,6 +41,7 @@ class AlohaInputs(transforms.DataTransformFn):
     #   "trossen": original Aloha pipeline (state in linear position, action in joint angle).
     #   "sim": state and action both in [0, 1] (0=close, 1=open).
     #   "arx": state and action both in [-pi, 0] (0=close, -pi=open).
+    #   "agilex": state and action both in [0, 0.1] (0=close, 0.1=open).
     gripper_type: GripperType = "trossen"
 
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
@@ -228,6 +229,8 @@ def _gripper_state_to_pi(value: np.ndarray, gripper_type: GripperType) -> np.nda
         return value
     if gripper_type == "arx":
         return -value / np.pi
+    if gripper_type == "agilex":
+        return value / 0.1
     raise ValueError(f"Unknown gripper_type: {gripper_type}")
 
 
@@ -239,6 +242,8 @@ def _gripper_action_to_pi(value: np.ndarray, gripper_type: GripperType) -> np.nd
         return value
     if gripper_type == "arx":
         return -value / np.pi
+    if gripper_type == "agilex":
+        return value / 0.1
     raise ValueError(f"Unknown gripper_type: {gripper_type}")
 
 
@@ -250,4 +255,6 @@ def _gripper_action_from_pi(value: np.ndarray, gripper_type: GripperType) -> np.
         return value
     if gripper_type == "arx":
         return -value * np.pi
+    if gripper_type == "agilex":
+        return value * 0.1
     raise ValueError(f"Unknown gripper_type: {gripper_type}")

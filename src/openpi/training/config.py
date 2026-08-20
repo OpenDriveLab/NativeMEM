@@ -65,6 +65,9 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Resolved directory holding the data assets, i.e. the AssetsConfig override if the config sets
+    # one and the config's `assets_dirs` otherwise. Norm stats live in `assets_dir / asset_id`.
+    assets_dir: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -179,11 +182,13 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        assets_dir = epath.Path(self.assets.assets_dir or assets_dirs)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            assets_dir=str(assets_dir),
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=self._load_norm_stats(assets_dir, asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
@@ -236,7 +241,12 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
-    gripper_type: Literal["trossen", "sim", "arx"] = "trossen"
+    gripper_type: Literal["trossen", "sim", "arx", "agilex"] = "trossen"
+    # Boolean mask (see `transforms.make_bool_mask`) selecting action dims to hold at the
+    # current state value, e.g. to exclude an unused arm from single-arm finetuning. Annotated as
+    # tuple rather than Sequence because tyro lowers Sequence[bool] to a list and then fails to
+    # match the tuple make_bool_mask returns.
+    arm_action_mask: tuple[bool, ...] | None = None
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -261,6 +271,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
         )
+        if self.arm_action_mask is not None:
+            data_transforms = data_transforms.push(inputs=[_transforms.MaskActions(self.arm_action_mask)])
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
@@ -837,6 +849,92 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
+    ),
+    TrainConfig(
+        name="pi05_agilex_right",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="agilex/charge-0818",
+            assets=AssetsConfig(
+                assets_dir="assets",
+                asset_id="agilex/charge-0818"
+            ),
+            default_prompt="Pull out the charging gun and plug it back in",
+            gripper_type="agilex",
+            arm_action_mask=_transforms.make_bool_mask(7, -7),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.front",
+                                "cam_left_wrist": "observation.images.left",
+                                "cam_right_wrist": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=5000,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        )
+    ),
+    TrainConfig(
+        name="pi05_rtc_agilex_right",
+        model=pi0_config.Pi0Config(pi05=True, rtc=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="agilex/charge-0818",
+            assets=AssetsConfig(
+                assets_dir="assets",
+                asset_id="agilex/charge-0818"
+            ),
+            default_prompt="Pull out the charging gun and plug it back in",
+            gripper_type="agilex",
+            arm_action_mask=_transforms.make_bool_mask(7, -7),
+            base_config=DataConfig(prompt_from_task=True),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.front",
+                                "cam_left_wrist": "observation.images.left",
+                                "cam_right_wrist": "observation.images.right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=64,
+        num_workers=8,
+        num_train_steps=30_000,
+        save_interval=5000,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,
+        )
     ),
     #
     # Fine-tuning DROID configs.

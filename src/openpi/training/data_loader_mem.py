@@ -6,19 +6,17 @@ import random
 from typing import Any, Literal
 
 import jax
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
 import openpi.models.model as _model
-from openpi.training.data_loader import (
-    DataLoader,
-    DataLoaderImpl,
-    FakeDataset,
-    TorchDataLoader,
-    TransformedDataset,
-    transform_dataset,
-)
+from openpi.training.data_loader import DataLoader
+from openpi.training.data_loader import DataLoaderImpl
+from openpi.training.data_loader import FakeDataset
+from openpi.training.data_loader import TorchDataLoader
+from openpi.training.data_loader import TransformedDataset
+from openpi.training.data_loader import transform_dataset
 import openpi.transforms as _transforms
 
 

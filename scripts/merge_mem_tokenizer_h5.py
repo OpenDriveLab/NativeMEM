@@ -68,7 +68,12 @@ def merge_datasets(input_paths: Sequence[Path], output_path: Path, dataset_types
     next_episode_idx = 0
     total_frames = 0
 
-    with h5py.File(output_path, "w") as dst_h5:
+    # The `core` driver builds the file in memory and writes it to the backing
+    # store in one sequential pass at close. Plain incremental writes corrupt
+    # files on this repo's OrangeFS-backed NFS mount ("bad object header
+    # version number") because OrangeFS doesn't safely support HDF5's
+    # random-access read-modify-write metadata updates during file growth.
+    with h5py.File(output_path, "w", driver="core", backing_store=True) as dst_h5:
         for source_path, source_dataset_type in zip(source_files, dataset_types, strict=True):
             if not source_path.exists():
                 raise FileNotFoundError(f"Source dataset not found: {source_path}")

@@ -35,7 +35,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     # RTC (Real-Time Chunking) configuration. When True, create() returns Pi0RTC.
     rtc: bool = False
-    max_delay: int = 8
+    max_delay: int = 6
 
     pytorch_compile_mode: str | None = "max-autotune"
 

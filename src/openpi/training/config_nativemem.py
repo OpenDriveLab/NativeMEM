@@ -160,6 +160,9 @@ class LeRobotAlohaMemDataConfig(DataConfigFactory):
     adapt_to_pi: bool = True
     gripper_type: aloha_policy.GripperType = "trossen"
     memory_tokenizer_max_len: int | None = None
+    # Boolean mask (see `transforms.make_bool_mask`) selecting action dims to hold at the
+    # current state value, e.g. to exclude an unused arm from single-arm finetuning.
+    arm_action_mask: Sequence[bool] | None = None
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -188,6 +191,8 @@ class LeRobotAlohaMemDataConfig(DataConfigFactory):
             inputs=[AlohaMemInputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
         )
+        if self.arm_action_mask is not None:
+            data_transforms = data_transforms.push(inputs=[_transforms.MaskActions(self.arm_action_mask)])
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(

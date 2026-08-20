@@ -13,19 +13,19 @@ import flax.traverse_util
 import h5py
 import jax
 import jax.numpy as jnp
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
+from openpi_client import image_tools
 import tyro
 
-from openpi_client import image_tools
+from openpi.models.mem_tokenizer_config import MemTokenizerConfig
 import openpi.models.model as _model
+from openpi.models.model import restore_params
 import openpi.models.siglip as _siglip
 from openpi.models.siglip_encoder import SiglipEncoder
-from openpi.models.mem_tokenizer_config import MemTokenizerConfig
-import openpi.shared.download as download
-from openpi.models.model import restore_params
 from openpi.shared import array_typing as at
+import openpi.shared.download as download
 from openpi.training import weight_loaders
 
 
@@ -87,8 +87,7 @@ def _require_checkpoint_prefixes(loaded_params, prefixes: tuple[str, ...]) -> No
         if any(key.startswith(prefix + "/") for key in flat_loaded):
             continue
         raise ValueError(
-            "Checkpoint is missing required subtree "
-            f"'{prefix}'. Expected a mem_tokenizer checkpoint with {prefixes}."
+            f"Checkpoint is missing required subtree '{prefix}'. Expected a mem_tokenizer checkpoint with {prefixes}."
         )
 
 
@@ -216,10 +215,20 @@ def create_empty_dataset(
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
     motors = [
-        "left_waist", "left_shoulder", "left_elbow", "left_forearm_roll",
-        "left_wrist_angle", "left_wrist_rotate", "left_gripper",
-        "right_waist", "right_shoulder", "right_elbow", "right_forearm_roll",
-        "right_wrist_angle", "right_wrist_rotate", "right_gripper",
+        "left_waist",
+        "left_shoulder",
+        "left_elbow",
+        "left_forearm_roll",
+        "left_wrist_angle",
+        "left_wrist_rotate",
+        "left_gripper",
+        "right_waist",
+        "right_shoulder",
+        "right_elbow",
+        "right_forearm_roll",
+        "right_wrist_angle",
+        "right_wrist_rotate",
+        "right_gripper",
     ]
     cameras = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
     img_keys = list(_model.IMAGE_KEYS)
@@ -294,8 +303,7 @@ def populate_dataset(
                 instruction = random.choice(instructions)
             else:
                 print(
-                    f"Warning: No instruction found for episode {group_idx}, "
-                    f"using default instruction: {instruction}."
+                    f"Warning: No instruction found for episode {group_idx}, using default instruction: {instruction}."
                 )
 
             action = f["action"][begin_idx:end_idx]
@@ -313,13 +321,12 @@ def populate_dataset(
                 frame = {
                     "observation.state": state[i],
                     "action": action[i],
-                    "task": instruction,
                     "mem_token": mem_tokens[i],
                     "observation.images.cam_high": head_images[i].transpose(2, 0, 1),
                     "observation.images.cam_right_wrist": right_images[i].transpose(2, 0, 1),
                     "observation.images.cam_left_wrist": left_images[i].transpose(2, 0, 1),
                 }
-                dataset.add_frame(frame)
+                dataset.add_frame(frame, task=instruction)
 
             dataset.save_episode()
             logging.info("Converted episode %d with %d frames.", ep_idx, num_frames)

@@ -3,11 +3,19 @@
 This script is used to compute the normalization statistics for a given config. It
 will compute the mean and standard deviation of the data in the dataset and save it
 to the config assets directory.
+
+It takes the same CLI as `scripts/train.py`, so a dataset override used at training time must be
+repeated here verbatim -- otherwise the stats are computed over a different dataset than the one
+being trained on. `--exp_name` is required by `TrainConfig` but unused here:
+
+    python scripts/compute_norm_stats.py pi05_agilex_right --exp_name=norm_stats \
+        --data.repo_id=agilex/wipe_board --data.assets.asset_id=agilex/wipe_board
 """
+
+import pathlib
 
 import numpy as np
 import tqdm
-import tyro
 
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
@@ -27,7 +35,6 @@ def create_torch_dataloader(
     batch_size: int,
     model_config: _model.BaseModelConfig,
     num_workers: int,
-    max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
@@ -41,17 +48,12 @@ def create_torch_dataloader(
             RemoveStrings(),
         ],
     )
-    if max_frames is not None and max_frames < len(dataset):
-        num_batches = max_frames // batch_size
-        shuffle = True
-    else:
-        num_batches = len(dataset) // batch_size
-        shuffle = False
+    num_batches = len(dataset) // batch_size
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=shuffle,
+        shuffle=False,
         num_batches=num_batches,
     )
     return data_loader, num_batches
@@ -61,7 +63,6 @@ def create_rlds_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
     batch_size: int,
-    max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
     dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
     dataset = _data_loader.IterableTransformedDataset(
@@ -74,11 +75,8 @@ def create_rlds_dataloader(
         ],
         is_batched=True,
     )
-    if max_frames is not None and max_frames < len(dataset):
-        num_batches = max_frames // batch_size
-    else:
-        # NOTE: this length is currently hard-coded for DROID.
-        num_batches = len(dataset) // batch_size
+    # NOTE: this length is currently hard-coded for DROID.
+    num_batches = len(dataset) // batch_size
     data_loader = _data_loader.RLDSDataLoader(
         dataset,
         num_batches=num_batches,
@@ -86,17 +84,14 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
-    config = _config.get_config(config_name)
+def main(config: _config.TrainConfig):
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
-        data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, max_frames
-        )
+        data_loader, num_batches = create_rlds_dataloader(data_config, config.model.action_horizon, config.batch_size)
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers
         )
 
     keys = ["state", "actions"]
@@ -108,10 +103,19 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # Write exactly where training reads from: `data_config` is the same object train.py builds, so
+    # its resolved assets location is the single source of truth for both sides.
+    if "://" in data_config.assets_dir:
+        raise ValueError(
+            f"Config '{config.name}' reads assets from {data_config.assets_dir}, which is not writable. Point its "
+            "AssetsConfig.assets_dir at a local directory to compute norm stats for it."
+        )
+    output_path = pathlib.Path(data_config.assets_dir) / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    # Same CLI as `scripts/train.py`: norm stats must be computed with the exact data config that
+    # training will use, so both sides take identical `--data.*` overrides.
+    main(_config.cli())

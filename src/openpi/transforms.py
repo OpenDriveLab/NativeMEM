@@ -245,6 +245,33 @@ class AbsoluteActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class MaskActions(DataTransformFn):
+    """Replaces masked action dims with the current state value (hold position).
+
+    Applied before any delta-action conversion, so a masked dim collapses to a 0 delta
+    rather than a real training target. Used for single-arm finetuning on dual-arm-shaped
+    (14-dim) Aloha data, where the unused arm's action dims should not be trained on.
+    """
+
+    # Boolean mask selecting which action dims to hold at the current state value. Length
+    # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
+    # See `make_bool_mask` for more details.
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        state, actions = data["state"], data["actions"]
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        actions[..., :dims] = np.where(mask, np.expand_dims(state[..., :dims], axis=-2), actions[..., :dims])
+        data["actions"] = actions
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
