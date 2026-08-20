@@ -8,6 +8,7 @@ Usage:
 import dataclasses
 import functools
 import logging
+import os
 import pathlib
 import platform
 import sys
@@ -203,7 +204,13 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by process count {jax.process_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Prefer a persisted, NFS-backed cache (set via JAX_COMPILATION_CACHE_DIR) so compiled kernels
+    # survive across pod restarts; the pod's local ~/.cache is ephemeral and forces a full recompile
+    # on every job resubmission.
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        os.environ.get("JAX_COMPILATION_CACHE_DIR", str(epath.Path("~/.cache/jax").expanduser())),
+    )
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)

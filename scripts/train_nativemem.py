@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -35,7 +36,13 @@ Usage:
 
 
 def configure_runtime():
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Prefer a persisted, NFS-backed cache (set via JAX_COMPILATION_CACHE_DIR) so compiled kernels
+    # survive across pod restarts; the pod's local ~/.cache is ephemeral and forces a full recompile
+    # on every job resubmission.
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        os.environ.get("JAX_COMPILATION_CACHE_DIR", str(epath.Path("~/.cache/jax").expanduser())),
+    )
 
 
 def init_logging():
@@ -67,7 +74,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, mode="offline")
     else:
         wandb.init(name=config.exp_name, config=dataclasses.asdict(config), project=config.project_name, mode="offline")
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)

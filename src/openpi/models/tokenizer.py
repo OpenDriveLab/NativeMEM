@@ -47,6 +47,9 @@ class PaligemmaTokenizer:
 
         return np.asarray(tokens), np.asarray(mask)
 
+    def decode(self, tokens: np.ndarray) -> str:
+        return self._tokenizer.decode(np.asarray(tokens).tolist())
+
 
 class MemoryTokenizer:
     """Pad or truncate NativeMEM memory tokens."""

@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -17,6 +18,7 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
@@ -57,12 +59,13 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, mode="offline")
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            mode="offline"
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
@@ -192,6 +195,9 @@ def train_step(
 
 
 def main(config: _config.TrainConfig):
+    # Must run before any other JAX call: it decides how many devices this process sees.
+    sharding.init_distributed()
+
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -199,8 +205,16 @@ def main(config: _config.TrainConfig):
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
+    if config.batch_size % jax.process_count() != 0:
+        raise ValueError(f"Batch size {config.batch_size} must be divisible by process count {jax.process_count()}.")
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # Prefer a persisted, NFS-backed cache (set via JAX_COMPILATION_CACHE_DIR) so compiled kernels
+    # survive across pod restarts; the pod's local ~/.cache is ephemeral and forces a full recompile
+    # on every job resubmission.
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        os.environ.get("JAX_COMPILATION_CACHE_DIR", str(epath.Path("~/.cache/jax").expanduser())),
+    )
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -215,7 +229,8 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    # Only the primary process talks to wandb; the others would create duplicate runs.
+    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and jax.process_index() == 0)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -225,6 +240,13 @@ def main(config: _config.TrainConfig):
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    # Decode a few prompts from the first batch so the user can sanity check what was loaded.
+    prompt_tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len)
+    observation = batch[0]
+    for i in range(min(5, observation.tokenized_prompt.shape[0])):
+        valid_tokens = np.asarray(observation.tokenized_prompt[i])[np.asarray(observation.tokenized_prompt_mask[i])]
+        logging.info(f"Prompt[{i}]: {prompt_tokenizer.decode(valid_tokens)!r}")
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -253,6 +275,7 @@ def main(config: _config.TrainConfig):
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
+        disable=jax.process_index() != 0,
     )
 
     infos = []
@@ -264,7 +287,9 @@ def main(config: _config.TrainConfig):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            # logging.info, not pbar.write: tqdm_loggable swallows write() so metrics never reach
+            # the cluster's captured stdout.
+            logging.info(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
