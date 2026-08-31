@@ -191,14 +191,15 @@ class LeRobotAlohaMemDataConfig(DataConfigFactory):
             inputs=[AlohaMemInputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
         )
-        if self.arm_action_mask is not None:
-            data_transforms = data_transforms.push(inputs=[_transforms.MaskActions(self.arm_action_mask)])
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
+        # After DeltaActions, so masked gripper dims (which stay absolute) are zeroed too.
+        if self.arm_action_mask is not None:
+            data_transforms = data_transforms.push(inputs=[_transforms.MaskActions(self.arm_action_mask)])
 
         resolved_max_len = self.memory_tokenizer_max_len
         if resolved_max_len is None:

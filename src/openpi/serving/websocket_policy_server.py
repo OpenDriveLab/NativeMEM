@@ -56,9 +56,13 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
+                # RTC (see openpi.models.pi0_rtc): action_prefix/delay travel as reserved keys
+                # inside the observation payload, packed there by WebsocketClientPolicy.infer.
+                action_prefix = obs.pop("action_prefix", None)
+                delay = obs.pop("delay", None)
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = self._policy.infer(obs, action_prefix=action_prefix, delay=delay)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

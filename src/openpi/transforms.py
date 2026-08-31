@@ -136,13 +136,14 @@ class Normalize(DataTransformFn):
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
-        return (x - mean) / (std + 1e-6)
+        return np.where(std > 0, (x - mean) / (std + 1e-6), 0.0)
 
     def _normalize_quantile(self, x, stats: NormStats):
-        assert stats.q01 is not None
-        assert stats.q99 is not None
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
-        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        scale = q99 - q01
+        # `np.where` evaluates both branches, so keep the epsilon: without it a degenerate dim
+        # computes 0/0 and warns on every call even though the result is discarded.
+        return np.where(scale > 1e-6, (x - q01) / (scale + 1e-6) * 2.0 - 1.0, -1.0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -246,27 +247,41 @@ class AbsoluteActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class MaskActions(DataTransformFn):
-    """Replaces masked action dims with the current state value (hold position).
+    """Zeros out the masked dims of both `state` and `actions`.
 
-    Applied before any delta-action conversion, so a masked dim collapses to a 0 delta
-    rather than a real training target. Used for single-arm finetuning on dual-arm-shaped
-    (14-dim) Aloha data, where the unused arm's action dims should not be trained on.
+    Used for single-arm finetuning on dual-arm-shaped (14-dim) Aloha data: the unused arm is not
+    part of the task, so neither its commands nor its encoder readings should reach the model.
+
+    Applied *after* any delta-action conversion, so every masked action dim is an exact 0 target:
+    delta joint dims and absolute gripper dims alike. Holding a masked dim at the current state
+    value instead only zeroes the delta dims -- an absolute gripper dim would keep whatever the
+    unused arm's encoder happens to read, which is a real (and, once normalized against a dataset
+    where that encoder is hard-zeroed, explosive) training target.
+
+    The state is zeroed at inference too, not just during training, so the masked arm's live
+    readings cannot shift the observation away from what the model saw. Recompute norm stats after
+    changing the mask: the masked dims then have a degenerate range, which `Normalize` maps to a
+    constant rather than dividing by ~0.
     """
 
-    # Boolean mask selecting which action dims to hold at the current state value. Length
-    # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
+    # Boolean mask selecting which state/action dims to zero out. Length can be smaller than the
+    # actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] = np.where(mask, np.expand_dims(state[..., :dims], axis=-2), actions[..., :dims])
-        data["actions"] = actions
+        state = np.array(data["state"])
+        state[..., :dims] = np.where(mask, 0.0, state[..., :dims])
+        data["state"] = state
+        if "actions" in data:
+            actions = np.array(data["actions"])
+            actions[..., :dims] = np.where(mask, 0.0, actions[..., :dims])
+            data["actions"] = actions
 
         return data
 

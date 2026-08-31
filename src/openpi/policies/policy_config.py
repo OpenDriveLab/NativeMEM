@@ -65,6 +65,8 @@ def create_trained_policy(
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = data_config.norm_stats
+    else:
+        logging.info("Use customized norm stats")
 
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:

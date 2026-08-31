@@ -271,14 +271,15 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi, gripper_type=self.gripper_type)],
         )
-        if self.arm_action_mask is not None:
-            data_transforms = data_transforms.push(inputs=[_transforms.MaskActions(self.arm_action_mask)])
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
+        # After DeltaActions, so masked gripper dims (which stay absolute) are zeroed too.
+        if self.arm_action_mask is not None:
+            data_transforms = data_transforms.push(inputs=[_transforms.MaskActions(self.arm_action_mask)])
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
@@ -855,10 +856,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
             repo_id="agilex/charge-0818",
-            assets=AssetsConfig(
-                assets_dir="assets",
-                asset_id="agilex/charge-0818"
-            ),
+            assets=AssetsConfig(assets_dir="assets", asset_id="agilex/charge-0818"),
             default_prompt="Pull out the charging gun and plug it back in",
             gripper_type="agilex",
             arm_action_mask=_transforms.make_bool_mask(7, -7),
@@ -891,17 +889,14 @@ _CONFIGS = [
             peak_lr=2e-5,
             decay_steps=30_000,
             decay_lr=1e-6,
-        )
+        ),
     ),
     TrainConfig(
         name="pi05_rtc_agilex_right",
         model=pi0_config.Pi0Config(pi05=True, rtc=True),
         data=LeRobotAlohaDataConfig(
             repo_id="agilex/charge-0818",
-            assets=AssetsConfig(
-                assets_dir="assets",
-                asset_id="agilex/charge-0818"
-            ),
+            assets=AssetsConfig(assets_dir="assets", asset_id="agilex/charge-0818"),
             default_prompt="Pull out the charging gun and plug it back in",
             gripper_type="agilex",
             arm_action_mask=_transforms.make_bool_mask(7, -7),
@@ -934,7 +929,7 @@ _CONFIGS = [
             peak_lr=2e-5,
             decay_steps=30_000,
             decay_lr=1e-6,
-        )
+        ),
     ),
     #
     # Fine-tuning DROID configs.

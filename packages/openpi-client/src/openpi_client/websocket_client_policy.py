@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from typing_extensions import override
 import websockets.sync.client
@@ -44,8 +44,18 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 time.sleep(5)
 
     @override
-    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        data = self._packer.pack(obs)
+    def infer(  # noqa: UP006
+        self, obs: Dict, *, action_prefix: Optional[Any] = None, delay: Optional[int] = None
+    ) -> Dict:
+        # RTC (see openpi.models.pi0_rtc): action_prefix/delay ride inside the same dict under
+        # reserved keys, since the wire protocol only ever exchanges one payload. The server pops
+        # them back out before calling Policy.infer (see websocket_policy_server.py).
+        payload = obs
+        if action_prefix is not None and delay is not None:
+            payload = dict(obs)
+            payload["action_prefix"] = action_prefix
+            payload["delay"] = delay
+        data = self._packer.pack(payload)
         self._ws.send(data)
         response = self._ws.recv()
         if isinstance(response, str):

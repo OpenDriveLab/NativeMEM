@@ -1,6 +1,7 @@
 import dataclasses
 import enum
 import logging
+import pathlib
 import socket
 
 import tyro
@@ -8,6 +9,7 @@ import tyro
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
+from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 
 
@@ -28,6 +30,9 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Path to a norm_stats.json file to use instead of the one bundled with the checkpoint
+    # (e.g., "assets/agilex/charge-0818/norm_stats.json").
+    asset_path: str | None = None
 
 
 @dataclasses.dataclass
@@ -47,7 +52,7 @@ class Args:
     default_prompt: str | None = None
 
     # Port to serve the policy on.
-    port: int = 8000
+    port: int = 8010
     # Record the policy's behavior for debugging.
     record: bool = False
 
@@ -89,8 +94,15 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            norm_stats = None
+            if args.policy.asset_path is not None:
+                norm_stats = _normalize.load(args.policy.asset_path)
+                logging.info(f"Loaded customized norm stats from {args.policy.asset_path}")
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                norm_stats=norm_stats,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
