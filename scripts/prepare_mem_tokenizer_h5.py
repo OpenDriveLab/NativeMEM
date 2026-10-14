@@ -1,30 +1,64 @@
-"""Convert RoboTwin/RMBench raw HDF5 episodes into memory-tokenizer HDF5 format."""
+"""One-shot Stage 1 data prep: raw RoboTwin/RMBench episodes -> memory-tokenizer HDF5 + its norm stats.
 
-from __future__ import annotations
+`sources.json` lists raw `.../data` dirs (glob patterns allowed) under a single dataset_type:
 
-import argparse
-from collections.abc import Sequence
+    {"sim": ["data/RMBench/*/demo_clean/data"]}
+
+Each output file is one training dataset with its own norm stats at <assets_dir>/<output stem>/norm_stats.json,
+e.g. sim.h5 -> assets/sim/norm_stats.json; build one file per dataset_type and train on the list.
+
+Example:
+    python scripts/prepare_mem_tokenizer_h5.py --sources data/sources.json \
+        --output_path data/sim.h5 --assets_dir assets
+"""
+
+import dataclasses
+import glob
 import json
-from pathlib import Path
+import pathlib
 import re
 
 import cv2
 import h5py
 import numpy as np
-from tqdm import tqdm
+import tqdm
+import tyro
 
+import openpi.policies.aloha_policy as aloha_policy
+import openpi.shared.normalize as normalize
+from openpi.training.data_loader_mem_tokenizer import DATASET_TYPES
+import openpi.transforms as _transforms
+
+# Output camera dataset name -> raw camera dataset.
 CAMERA_DATASETS = {
     "cam_head": "/observation/head_camera/rgb",
     "cam_right": "/observation/right_camera/rgb",
     "cam_left": "/observation/left_camera/rgb",
 }
 ACTION_DATASET = "/joint_action/vector"
-DATASET_TYPES = ("trossen", "sim", "arx")
+# Prompts for tasks whose raw data ships without instructions/episode<N>.json.
 DEFAULT_INSTRUCTIONS = {
     "click_button": "press the buttons in the order of blue, pink and yellow",
     "click_button_rand": "press each of the three buttons once",
 }
 EPISODE_ID_PATTERN = re.compile(r"episode[_-]?(\d+)")
+
+
+@dataclasses.dataclass
+class Args:
+    sources: pathlib.Path
+    output_path: pathlib.Path
+    overwrite: bool = False
+    # Norm stats are written to <assets_dir>/<output_path stem>/norm_stats.json.
+    assets_dir: pathlib.Path = pathlib.Path("assets")
+    action_horizon: int = 50
+    height: int = 224
+    width: int = 224
+    quality: int = 95
+    instruction_key: str = "seen"
+    instruction_map: pathlib.Path | None = None
+    default_instruction: list[str] = dataclasses.field(default_factory=list)
+    fallback_instruction: str | None = None
 
 
 def resize_with_pad_cv2(image: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -36,7 +70,6 @@ def resize_with_pad_cv2(image: np.ndarray, height: int, width: int) -> np.ndarra
     scale = min(width / cur_w, height / cur_h)
     resized_w = max(1, round(cur_w * scale))
     resized_h = max(1, round(cur_h * scale))
-
     interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
     resized = cv2.resize(image, (resized_w, resized_h), interpolation=interpolation)
 
@@ -62,43 +95,44 @@ def decode_image(encoded_image) -> np.ndarray:
     return image
 
 
-def encode_images(images: Sequence[np.ndarray], quality: int) -> np.ndarray:
+def decode_resize_encode(camera_frames, height: int, width: int, quality: int) -> np.ndarray:
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-    encoded_images = np.empty(len(images), dtype=object)
-    for index, image in enumerate(images):
-        ok, encoded = cv2.imencode(".jpg", image, encode_param)
+    encoded_images = np.empty(len(camera_frames), dtype=object)
+    for index, frame in enumerate(camera_frames):
+        ok, encoded = cv2.imencode(".jpg", resize_with_pad_cv2(decode_image(frame), height, width), encode_param)
         if not ok:
             raise ValueError(f"JPEG encoding failed at frame index {index}")
         encoded_images[index] = encoded.astype(np.uint8)
     return encoded_images
 
 
-def decode_resize_encode(camera_frames, height: int, width: int, quality: int) -> np.ndarray:
-    images = []
-    for frame in camera_frames:
-        image = decode_image(frame)
-        images.append(resize_with_pad_cv2(image, height, width))
-    return encode_images(images, quality=quality)
+def read_raw_episode(
+    episode_path: pathlib.Path, height: int, width: int, quality: int
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """Read one raw episode as resized JPEG frames plus state[t] = vec[t], action[t] = vec[t + 1]."""
+    with h5py.File(episode_path, "r") as h5_file:
+        missing = [path for path in [*CAMERA_DATASETS.values(), ACTION_DATASET] if path not in h5_file]
+        if missing:
+            raise KeyError(f"Missing datasets {missing} in {episode_path}")
+
+        # The last camera frame has no next action, so it is dropped.
+        frames = {
+            camera_name: decode_resize_encode(h5_file[source_path][:-1], height, width, quality)
+            for camera_name, source_path in CAMERA_DATASETS.items()
+        }
+        vector = np.asarray(h5_file[ACTION_DATASET][:], dtype=np.float32)
+        if len(vector) < 2:
+            raise ValueError(f"Need at least two action frames in {episode_path}, got {len(vector)}")
+
+    state = vector[:-1]
+    action = vector[1:]
+    camera_lengths = {camera_name: len(images) for camera_name, images in frames.items()}
+    if set(camera_lengths.values()) != {len(state)}:
+        raise ValueError(f"Camera/action length mismatch in {episode_path}: {camera_lengths}, action={len(state)}")
+    return frames, state, action
 
 
-def parse_episode_id(path: Path) -> int | None:
-    match = EPISODE_ID_PATTERN.search(path.stem)
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
-def read_manifest(path: Path) -> list[Path]:
-    dataset_dirs = []
-    with path.open("r", encoding="utf-8") as manifest_file:
-        for line in manifest_file:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                dataset_dirs.append(Path(stripped))
-    return dataset_dirs
-
-
-def load_instruction_map(path: Path | None, pairs: Sequence[str]) -> dict[str, str]:
+def load_instruction_map(path: pathlib.Path | None, pairs: list[str]) -> dict[str, str]:
     instruction_map = dict(DEFAULT_INSTRUCTIONS)
     if path is not None:
         with path.open("r", encoding="utf-8") as instruction_file:
@@ -116,210 +150,148 @@ def load_instruction_map(path: Path | None, pairs: Sequence[str]) -> dict[str, s
 
 
 def load_episode_instructions(
-    episode_path: Path,
-    dataset_dir: Path,
+    episode_path: pathlib.Path,
+    dataset_dir: pathlib.Path,
     *,
     instruction_key: str,
     instruction_map: dict[str, str],
     fallback_instruction: str | None,
 ) -> list[str]:
-    task_name = dataset_dir.parent.parent.name
-    episode_id = parse_episode_id(episode_path)
-    if episode_id is not None:
-        instruction_path = dataset_dir.parent.parent / "instructions" / f"episode{episode_id}.json"
+    """Instructions from <task>/<demo>/instructions/episode<N>.json, next to the <task>/<demo>/data dir."""
+    match = EPISODE_ID_PATTERN.search(episode_path.stem)
+    if match is not None:
+        instruction_path = dataset_dir.parent / "instructions" / f"episode{int(match.group(1))}.json"
         if instruction_path.exists():
             with instruction_path.open("r", encoding="utf-8") as instruction_file:
-                instruction_dict = json.load(instruction_file)
-            instructions = instruction_dict.get(instruction_key)
+                instructions = json.load(instruction_file).get(instruction_key)
             if isinstance(instructions, str):
                 return [instructions]
             if instructions:
                 return [str(instruction) for instruction in instructions]
-
-    instruction = instruction_map.get(task_name) or fallback_instruction or task_name.replace("_", " ")
-    return [instruction]
-
-
-class TrajectoryDataset:
-    def __init__(
-        self,
-        dataset_dir: Path,
-        *,
-        height: int,
-        width: int,
-        quality: int,
-        instruction_key: str,
-        instruction_map: dict[str, str],
-        fallback_instruction: str | None,
-    ):
-        self.dataset_dir = dataset_dir
-        self.data_files = sorted({*dataset_dir.glob("*.hdf5"), *dataset_dir.glob("*.h5")})
-        self.height = height
-        self.width = width
-        self.quality = quality
-        self.instruction_key = instruction_key
-        self.instruction_map = instruction_map
-        self.fallback_instruction = fallback_instruction
-
-    def __len__(self) -> int:
-        return len(self.data_files)
-
-    def __iter__(self):
-        for index in range(len(self)):
-            yield self.extract_hdf5_data(index)
-
-    def extract_hdf5_data(self, index: int):
-        episode_path = self.data_files[index]
-        with h5py.File(episode_path, "r") as h5_file:
-            missing = [path for path in [*CAMERA_DATASETS.values(), ACTION_DATASET] if path not in h5_file]
-            if missing:
-                raise KeyError(f"Missing datasets {missing} in {episode_path}")
-
-            cam_dict = {
-                camera_name: decode_resize_encode(h5_file[source_path][:-1], self.height, self.width, self.quality)
-                for camera_name, source_path in CAMERA_DATASETS.items()
-            }
-            vector = np.asarray(h5_file[ACTION_DATASET][:], dtype=np.float32)
-            if len(vector) < 2:
-                raise ValueError(f"Need at least two action frames in {episode_path}, got {len(vector)}")
-
-        state = vector[:-1]
-        action = vector[1:]
-        episode_len = len(state)
-        camera_lengths = {camera_name: len(camera_frames) for camera_name, camera_frames in cam_dict.items()}
-        if set(camera_lengths.values()) != {episode_len}:
-            raise ValueError(f"Camera/action length mismatch in {episode_path}: {camera_lengths}, action={episode_len}")
-
-        instructions = load_episode_instructions(
-            episode_path,
-            self.dataset_dir,
-            instruction_key=self.instruction_key,
-            instruction_map=self.instruction_map,
-            fallback_instruction=self.fallback_instruction,
-        )
-        return cam_dict, state, action, instructions
+        else:
+            task_name = dataset_dir.parent.parent.name
+            if task_name in instruction_map or fallback_instruction is not None:
+                print(f"Warning: no instructions file {instruction_path} for {episode_path}; using default instruction: {instruction_map.get(task_name) or fallback_instruction}")
+                return [instruction_map.get(task_name) or fallback_instruction]
+            else:
+                print(f"Warning: no instructions file {instruction_path} for {episode_path}; using task name as instruction")
+                return [task_name]
 
 
-def collect_dataset_dirs(dataset_dirs: Sequence[Path], manifest: Path | None) -> list[Path]:
-    collected = list(dataset_dirs)
-    if manifest is not None:
-        collected.extend(read_manifest(manifest))
-    if not collected:
-        raise ValueError("Provide at least one --dataset_dir or --dataset_manifest.")
-
-    resolved = []
-    for dataset_dir in collected:
-        expanded_dir = dataset_dir.expanduser()
-        if not expanded_dir.exists():
-            raise FileNotFoundError(f"Dataset directory not found: {expanded_dir}")
-        if not expanded_dir.is_dir():
-            raise NotADirectoryError(f"Expected dataset directory, got: {expanded_dir}")
-        resolved.append(expanded_dir)
-    return resolved
-
-
-def extract_datasets(
-    dataset_dirs: Sequence[Path],
-    output_path: Path,
+def accumulate_episode_stats(
+    stats: dict[str, normalize.RunningStats],
+    state: np.ndarray,
+    action: np.ndarray,
     *,
-    dataset_type: str,
-    height: int,
-    width: int,
-    quality: int,
-    instruction_key: str,
-    instruction_map: dict[str, str],
-    fallback_instruction: str | None,
+    gripper_type: aloha_policy.GripperType,
+    action_horizon: int,
 ) -> None:
-    if dataset_type not in DATASET_TYPES:
-        raise ValueError(f"dataset_type must be one of {DATASET_TYPES}, got {dataset_type!r}")
+    """Update `stats` with one episode, using the training-time AlohaInputs -> DeltaActions transforms."""
+    aloha_inputs = aloha_policy.AlohaInputs(adapt_to_pi=True, gripper_type=gripper_type)
+    delta_actions = _transforms.DeltaActions(_transforms.make_bool_mask(6, -1, 6, -1))
+    # AlohaInputs requires an "images" dict containing at least cam_high; images do not affect the stats.
+    dummy_image = np.zeros((3, 1, 1), dtype=np.uint8)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_comp_kwargs = {"compression": "gzip", "compression_opts": 4}
+    episode_len = len(state)
+    for t in range(episode_len):
+        # Same action window as the Stage 1 loader: the next action_horizon actions, padded with the last one.
+        window = action[t : min(t + action_horizon, episode_len)]
+        if window.shape[0] < action_horizon:
+            pad = np.repeat(window[-1:], action_horizon - window.shape[0], axis=0)
+            window = np.concatenate([window, pad], axis=0)
+
+        sample = {"state": state[t].copy(), "actions": window.copy(), "images": {"cam_high": dummy_image}}
+        sample = delta_actions(aloha_inputs(sample))
+        stats["state"].update(sample["state"][None, :])
+        stats["actions"].update(sample["actions"])
+
+
+def load_sources(path: pathlib.Path) -> dict[str, list[pathlib.Path]]:
+    with path.open("r", encoding="utf-8") as sources_file:
+        sources = json.load(sources_file)
+    unknown = sorted(set(sources) - set(DATASET_TYPES))
+    if unknown:
+        raise ValueError(f"Unknown dataset_type keys {unknown} in {path}; expected a subset of {DATASET_TYPES}")
+
+    out = {}
+    for dataset_type, patterns in sources.items():
+        dirs = []
+        for pattern in patterns:
+            matches = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
+            if not matches:
+                raise FileNotFoundError(f"Pattern {pattern!r} for {dataset_type!r} matched no directories")
+            dirs.extend(pathlib.Path(match).expanduser() for match in matches)
+        for dataset_dir in dirs:
+            if not dataset_dir.is_dir():
+                raise NotADirectoryError(f"Dataset directory not found: {dataset_dir}")
+        out[dataset_type] = dirs
+    return out
+
+
+def main(args: Args) -> None:
+    sources = load_sources(args.sources)
+    # One norm-stats file per output, so all its episodes must share one gripper convention.
+    if len(sources) != 1:
+        raise ValueError(f"{args.sources} must list exactly one dataset_type, got {sorted(sources)}")
+    ((dataset_type, dataset_dirs),) = sources.items()
+    instruction_map = load_instruction_map(args.instruction_map, args.default_instruction)
+    stats_dir = args.assets_dir / args.output_path.stem
+    print(f"Preparing {dataset_type} HDF5 dataset at {args.output_path} from sources {args.sources}")
+    if args.output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"{args.output_path} exists; pass --overwrite to replace it")
+    if (stats_dir / "norm_stats.json").exists() and not args.overwrite:
+        raise FileExistsError(f"{stats_dir / 'norm_stats.json'} exists; pass --overwrite to replace it")
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+
     vlen_u8 = h5py.vlen_dtype(np.dtype("uint8"))
     str_dtype = h5py.string_dtype(encoding="utf-8")
+    stats = {"state": normalize.RunningStats(), "actions": normalize.RunningStats()}
     episode_ends = []
     episode_idx = []
-    global_episode_idx = 0
-    total_frames = 0
-
-    with h5py.File(output_path, "w") as h5_file:
+    num_episodes = 0
+    num_frames = 0
+    with h5py.File(args.output_path, "w", driver="core", backing_store=True) as h5_file:
         for dataset_dir in dataset_dirs:
-            dataset = TrajectoryDataset(
-                dataset_dir,
-                height=height,
-                width=width,
-                quality=quality,
-                instruction_key=instruction_key,
-                instruction_map=instruction_map,
-                fallback_instruction=fallback_instruction,
-            )
-            for cam_dict, state, action, instructions in tqdm(dataset, desc=f"Extracting {dataset_dir}"):
-                episode_len = len(state)
-                total_frames += episode_len
-                episode_ends.append(total_frames)
-                episode_idx.extend((global_episode_idx, frame_idx) for frame_idx in range(episode_len))
+            episode_paths = sorted({*dataset_dir.glob("*.hdf5"), *dataset_dir.glob("*.h5")})
+            for episode_path in tqdm.tqdm(episode_paths, desc=f"{dataset_type}: {dataset_dir}"):
+                frames, state, action = read_raw_episode(episode_path, args.height, args.width, args.quality)
+                instructions = load_episode_instructions(
+                    episode_path,
+                    dataset_dir,
+                    instruction_key=args.instruction_key,
+                    instruction_map=instruction_map,
+                    fallback_instruction=args.fallback_instruction,
+                )
 
-                group = h5_file.create_group(f"episode_{global_episode_idx:0>8d}")
+                episode_len = len(state)
+                episode_idx.extend((num_episodes, frame_idx) for frame_idx in range(episode_len))
+                num_frames += episode_len
+                episode_ends.append(num_frames)
+
+                group = h5_file.create_group(f"episode_{num_episodes:0>8d}")
                 group.attrs["dataset_type"] = dataset_type
-                group.create_dataset("cam_head", data=cam_dict["cam_head"], dtype=vlen_u8)
-                group.create_dataset("cam_left", data=cam_dict["cam_left"], dtype=vlen_u8)
-                group.create_dataset("cam_right", data=cam_dict["cam_right"], dtype=vlen_u8)
+                for camera_name, images in frames.items():
+                    group.create_dataset(camera_name, data=images, dtype=vlen_u8)
                 group.create_dataset("state", data=state, dtype=np.float32)
                 group.create_dataset("action", data=action, dtype=np.float32)
                 group.create_dataset("instructions", data=instructions, dtype=str_dtype)
-                global_episode_idx += 1
+                num_episodes += 1
 
-        for key in ("episode_ends", "episode_idx"):
-            if key in h5_file:
-                del h5_file[key]
+                accumulate_episode_stats(
+                    stats, state, action, gripper_type=dataset_type, action_horizon=args.action_horizon
+                )
+
+        if num_episodes == 0:
+            raise ValueError(f"No episodes found in {args.sources}")
+        meta_comp_kwargs = {"compression": "gzip", "compression_opts": 4}
         h5_file.create_dataset("episode_ends", data=np.asarray(episode_ends, dtype=np.int64), **meta_comp_kwargs)
         h5_file.create_dataset("episode_idx", data=np.asarray(episode_idx, dtype=np.int64), **meta_comp_kwargs)
+        print(f"Writing {num_episodes} episodes and {num_frames} frames to {args.output_path}")
 
-    print(f"Wrote {global_episode_idx} episodes and {total_frames} frames to {output_path}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset_dir",
-        type=Path,
-        nargs="+",
-        action="extend",
-        default=[],
-        help="Raw RoboTwin/RMBench data dir. Accepts one or more dirs and can be repeated.",
-    )
-    parser.add_argument("--dataset_manifest", type=Path, help="Text file with one raw data dir per line.")
-    parser.add_argument("--output_path", type=Path, required=True, help="Path to write the memory-tokenizer HDF5 file.")
-    parser.add_argument("--dataset_type", choices=DATASET_TYPES, default="sim", help="Episode dataset_type attribute.")
-    parser.add_argument("--height", type=int, default=224, help="Output image height.")
-    parser.add_argument("--width", type=int, default=224, help="Output image width.")
-    parser.add_argument("--quality", type=int, default=95, help="JPEG quality.")
-    parser.add_argument("--instruction_key", default="seen", help="Instruction JSON key to read when present.")
-    parser.add_argument("--instruction_map", type=Path, help="JSON object mapping task names to fallback prompts.")
-    parser.add_argument(
-        "--default_instruction",
-        action="append",
-        default=[],
-        metavar="TASK=TEXT",
-        help="Fallback prompt for one task. Can be passed multiple times.",
-    )
-    parser.add_argument("--fallback_instruction", help="Fallback prompt used when task-specific text is unavailable.")
-    args = parser.parse_args()
-
-    dataset_dirs = collect_dataset_dirs(args.dataset_dir, args.dataset_manifest)
-    instruction_map = load_instruction_map(args.instruction_map, args.default_instruction)
-    extract_datasets(
-        dataset_dirs,
-        args.output_path,
-        dataset_type=args.dataset_type,
-        height=args.height,
-        width=args.width,
-        quality=args.quality,
-        instruction_key=args.instruction_key,
-        instruction_map=instruction_map,
-        fallback_instruction=args.fallback_instruction,
-    )
+    normalize.save(stats_dir, {key: s.get_statistics() for key, s in stats.items()})
+    print(f"{dataset_type}: {num_episodes} episodes, {num_frames} frames")
+    print(f"HDF5 dataset: {args.output_path}; norm stats: {stats_dir / 'norm_stats.json'}")
 
 
 if __name__ == "__main__":
-    main()
+    main(tyro.cli(Args))

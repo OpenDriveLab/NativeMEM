@@ -1,8 +1,10 @@
 """MemTokenizer action-pretraining script.
 
 Usage:
-    python scripts/train_mem_tokenizer.py mem_tokenizer_pretrain \
-        --exp_name=debug --data.repo_id=/path/to/train.h5 --overwrite
+    python scripts/train_mem_tokenizer.py mem_tokenizer_pretrain --exp_name=debug --num_workers=2 --overwrite
+
+`mem_tokenizer_pretrain` trains on the `datasets` list (H5 file + its norm_stats dir) set in
+`src/openpi/training/config_mem_tokenizer.py`.
 """
 
 import dataclasses
@@ -21,16 +23,19 @@ from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config_mem_tokenizer as _config
-from openpi.training.data_loader_mem_tokenizer import PrefetchIterator, create_mem_tokenizer_data_loader
+from openpi.training.data_loader_mem_tokenizer import PrefetchIterator
+from openpi.training.data_loader_mem_tokenizer import create_mem_tokenizer_data_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
@@ -187,6 +192,26 @@ def train_step(
     return new_state, info
 
 
+def log_batch_prompts(config: _config.TrainConfig, batch: _model.Observation) -> None:
+    """Decode this process's rows of the tokenized prompts, i.e. the exact text the model sees."""
+    tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len)
+    # The batch is a global array; read only the local shards, once per row range (devices may hold replicas).
+    rows = {}
+    for tokens, mask in zip(
+        batch.tokenized_prompt.addressable_shards, batch.tokenized_prompt_mask.addressable_shards, strict=True
+    ):
+        start = tokens.index[0].start or 0
+        rows.setdefault(start, (np.asarray(tokens.data), np.asarray(mask.data)))
+    lines = []
+    for start in sorted(rows):
+        tokens, mask = rows[start]
+        lines.extend(
+            f"  [{start + i}] {tokenizer.decode(row_tokens[row_mask])!r}"
+            for i, (row_tokens, row_mask) in enumerate(zip(tokens, mask, strict=True))
+        )
+    logging.info("First batch prompts (process %d):\n%s", jax.process_index(), "\n".join(lines))
+
+
 def main(config: _config.TrainConfig):
     # Must run before any other JAX call: it decides how many devices this process sees.
     sharding.init_distributed()
@@ -233,6 +258,7 @@ def main(config: _config.TrainConfig):
     data_iter = PrefetchIterator(iter(data_loader), prefetch_size=prefetch_size)
     batch, actions = next(data_iter)
     logging.info(f"Initialized MemTokenizer data loader (prefetch_size={prefetch_size})")
+    log_batch_prompts(config, batch)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)

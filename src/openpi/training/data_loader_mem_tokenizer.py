@@ -55,16 +55,26 @@ def _validate_norm_stats(
             raise ValueError(
                 f"{dataset_type!r} {feature} norm stats contain gripper quantiles outside pi0 space: "
                 f"q01={q01}, q99={q99}. Regenerate them with "
-                f"`python scripts/compute_norm_stats_h5.py ... --gripper-type {dataset_type}`."
+                "`python scripts/prepare_mem_tokenizer_h5.py` with the correct dataset_type key."
             )
+
+
+@dataclasses.dataclass(frozen=True)
+class H5Dataset:
+    """One `scripts/prepare_mem_tokenizer_h5.py` output and the directory holding its norm_stats.json."""
+
+    path: str
+    norm_stats_dir: str
 
 
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
     repo_id: str | None = None
     asset_id: str | None = None
-    # Norm stats per dataset_type. Each entry maps {"state", "actions"} -> NormStats.
+    # Norm stats per sample `norm_key` (the H5 path). Each entry maps {"state", "actions"} -> NormStats.
     norm_stats: dict[str, dict[str, _transforms.NormStats]] | None = None
+    # The H5 files to train on, each normalized with its own stats.
+    h5_datasets: tuple[H5Dataset, ...] = ()
     transforms: Sequence[_transforms.DataTransformFn] = dataclasses.field(default_factory=tuple)
     use_quantile_norm: bool = True
     load_in_memory: bool = False
@@ -86,7 +96,7 @@ class AlohaTemporalInputs(_transforms.DataTransformFn):
         dataset_type = data.get("dataset_type", None)
         extras = {
             key: data[key]
-            for key in ("image_seq", "image_seq_mask", "history_positions", "dataset_type")
+            for key in ("image_seq", "image_seq_mask", "history_positions", "dataset_type", "norm_key")
             if key in data
         }
         canonical = aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi, gripper_type=dataset_type)(
@@ -101,24 +111,24 @@ class AlohaTemporalInputs(_transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PerDatasetNormalize(_transforms.DataTransformFn):
-    """Dispatches Normalize by `dataset_type` in the sample, then drops that field."""
+    """Dispatches Normalize by `norm_key` in the sample, then drops it and `dataset_type`."""
 
-    normalizers: dict  # dataset_type -> _transforms.Normalize
+    normalizers: dict  # norm_key -> _transforms.Normalize
 
     def __call__(self, data: dict) -> dict:
         if not self.normalizers:
             # No norm stats loaded (e.g. fake config) — match Normalize(None) no-op behavior.
             data.pop("dataset_type", None)
+            data.pop("norm_key", None)
             return data
-        dataset_type = data.get("dataset_type", None)
-        normalize = self.normalizers.get(dataset_type)
+        norm_key = data.get("norm_key")
+        normalize = self.normalizers.get(norm_key)
         if normalize is None:
-            raise KeyError(
-                f"No norm stats loaded for dataset_type={dataset_type!r}; "
-                f"available: {sorted(self.normalizers)}"
-            )
+            raise KeyError(f"No norm stats loaded for norm_key={norm_key!r}; available: {sorted(self.normalizers)}")
         out = normalize(data)
-        out.pop("dataset_type", None)  # string field; must not reach batching.
+        # String fields; must not reach batching.
+        out.pop("dataset_type", None)
+        out.pop("norm_key", None)
         return out
 
 
@@ -129,11 +139,10 @@ def build_model_transforms(
     default_prompt: str,
     gripper_type: aloha_policy.GripperType | None,
 ) -> tuple[_transforms.DataTransformFn, ...]:
-    # Build one Normalize per dataset_type so we don't reinstantiate per sample.
-    per_type_stats = norm_stats or {}
+    # Build one Normalize per norm_key so we don't reinstantiate per sample.
     normalizers = {
-        dataset_type: _transforms.Normalize(stats, use_quantiles=True)
-        for dataset_type, stats in per_type_stats.items()
+        norm_key: _transforms.Normalize(stats, use_quantiles=True)
+        for norm_key, stats in (norm_stats or {}).items()
         if stats is not None
     }
     return (
@@ -163,25 +172,10 @@ class DataConfigFactory(abc.ABC):
     default_prompt: str = ""
     # None means use each H5 episode's dataset_type attr as the gripper type.
     gripper_type: aloha_policy.GripperType | None = None
-    # Base directory containing one subdirectory per dataset_type (sim/ trossen/ arx/),
-    # each holding a norm_stats.json. Local path or gs:// URI.
-    norm_stats_assets_dir: str = "assets"
 
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         raise NotImplementedError
-
-    def _load_norm_stats(self) -> dict[str, dict[str, _transforms.NormStats]] | None:
-        base = pathlib.Path(_download.maybe_download(self.norm_stats_assets_dir))
-        out: dict[str, dict[str, _transforms.NormStats]] = {}
-        for dataset_type in DATASET_TYPES:
-            try:
-                stats = _normalize.load(base / dataset_type)
-                _validate_norm_stats(dataset_type, stats)
-                out[dataset_type] = stats
-            except FileNotFoundError:
-                logging.info("Norm stats not found in %s/%s", self.norm_stats_assets_dir, dataset_type)
-        return out or None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,7 +185,7 @@ class FakeDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         del assets_dirs
-        norm_stats = self._load_norm_stats()
+        norm_stats = None
         return DataConfig(
             repo_id=self.repo_id,
             asset_id=self.repo_id,
@@ -212,14 +206,29 @@ class FakeDataConfig(DataConfigFactory):
 
 @dataclasses.dataclass(frozen=True)
 class H5MemTokenizerDataConfig(DataConfigFactory):
+    repo_id: str = "h5_datasets"
+    # `scripts/prepare_mem_tokenizer_h5.py` outputs (one dataset_type each), each with its own norm stats.
+    datasets: tuple[H5Dataset, ...] = ()
+
+    def _load_h5_norm_stats(self) -> dict[str, dict[str, _transforms.NormStats]]:
+        out = {}
+        for dataset in self.datasets:
+            stats = _normalize.load(pathlib.Path(_download.maybe_download(dataset.norm_stats_dir)))
+            _validate_norm_stats(dataset.path, stats)
+            out[dataset.path] = stats
+        return out
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         del assets_dirs
-        norm_stats = self._load_norm_stats()
+        if not self.datasets:
+            raise ValueError("H5MemTokenizerDataConfig.datasets is empty; list the H5 files to train on.")
+        norm_stats = self._load_h5_norm_stats()
         return DataConfig(
             repo_id=self.repo_id,
             asset_id=self.repo_id,
             norm_stats=norm_stats,
+            h5_datasets=self.datasets,
             transforms=build_model_transforms(
                 model_config,
                 norm_stats=norm_stats,
@@ -237,6 +246,10 @@ class H5MemTokenizerDataConfig(DataConfigFactory):
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
+def _decode_attr(value) -> str:
+    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
 
 class H5MemTokenizerDataset(torch.utils.data.Dataset):
     _CAM_TO_IMAGE_KEY = {
@@ -259,8 +272,10 @@ class H5MemTokenizerDataset(torch.utils.data.Dataset):
         stride_range: tuple[int, int],
         load_in_memory: bool = False,
         default_prompt: str = "",
+        norm_key: str,
     ):
         self._h5_path = h5_path
+        self._norm_key = norm_key
         self._history_seq_len = history_seq_len
         self._seq_len = history_seq_len + 1
         self._action_horizon = action_horizon
@@ -269,58 +284,55 @@ class H5MemTokenizerDataset(torch.utils.data.Dataset):
         self._default_prompt = default_prompt
         self._h5_file = None
         self._episodes: list[dict] = []
-        self._global_to_local: list[tuple[int, int]] = []
-        self._local_to_global: dict[tuple[int, int], int] = {}
-        self._valid_samples: list[tuple[int, int, int, int]] = []
+        # Rows of (global_index, episode_index, local_index, stride); an array keeps worker pickling cheap.
+        self._valid_samples: np.ndarray
         self._episode_cache: dict[int, dict] | None = {} if load_in_memory else None
 
         with h5py.File(h5_path, "r") as h5_file:
-            episode_names = sorted(
-                name
-                for name in h5_file
-                if name.startswith("episode_") and isinstance(h5_file.get(name), h5py.Group)
-            )
-            for episode_index, episode_name in enumerate(episode_names):
-                episode_group = h5_file.get(episode_name)
-                if not isinstance(episode_group, h5py.Group):
-                    raise TypeError(f"Expected '{episode_name}' to be an HDF5 group, got {type(episode_group)}")
-                state_dataset = episode_group.get("state")
-                if state_dataset is None:
-                    raise KeyError(f"Episode '{episode_name}' is missing the 'state' dataset.")
-                episode_len = int(state_dataset.shape[0])
-                dataset_type_attr = episode_group.attrs.get("dataset_type", None)
-                if isinstance(dataset_type_attr, bytes):
-                    dataset_type_attr = dataset_type_attr.decode("utf-8")
-                dataset_type_attr = str(dataset_type_attr)
-                self._episodes.append({
-                    "index": episode_index,
-                    "name": episode_name,
-                    "length": episode_len,
-                    "dataset_type": dataset_type_attr,
-                })
+            self._episodes = self._index_single_type(h5_file)
 
-                if self._episode_cache is not None:
+            if self._episode_cache is not None:
+                for episode in self._episodes:
+                    episode_group = h5_file[episode["name"]]
                     instructions_dataset = episode_group.get("instructions")
                     if instructions_dataset is None:
-                        raise KeyError(f"Episode '{episode_name}' is missing the 'instructions' dataset.")
-                    self._episode_cache[episode_index] = {
-                        "cam_head": episode_group.get("cam_head")[:],
-                        "cam_left": episode_group.get("cam_left")[:],
-                        "cam_right": episode_group.get("cam_right")[:],
-                        "state": state_dataset[:],
-                        "action": episode_group.get("action")[:],
+                        raise KeyError(f"Episode '{episode['name']}' is missing the 'instructions' dataset.")
+                    self._episode_cache[episode["index"]] = {
+                        "cam_head": episode_group["cam_head"][:],
+                        "cam_left": episode_group["cam_left"][:],
+                        "cam_right": episode_group["cam_right"][:],
+                        "state": episode_group["state"][:],
+                        "action": episode_group["action"][:],
                         "instructions": [
                             instruction.decode("utf-8") if isinstance(instruction, bytes) else str(instruction)
                             for instruction in instructions_dataset[:]
                         ],
                     }
 
-                for local_index in range(episode_len):
-                    global_index = len(self._global_to_local)
-                    self._global_to_local.append((episode_index, local_index))
-                    self._local_to_global[(episode_index, local_index)] = global_index
-
         self._pre_calculate_sampling_indices()
+
+    @staticmethod
+    def _index_single_type(h5_file: h5py.File) -> list[dict]:
+        """Index a `scripts/prepare_mem_tokenizer_h5.py` output from its top-level `episode_ends` alone.
+
+        That script names episodes episode_{i:08d} in `episode_ends` order and writes one dataset_type per file,
+        so opening every episode group is unnecessary.
+        """
+        lengths = np.diff(np.asarray(h5_file["episode_ends"][:], dtype=np.int64), prepend=0)
+        last_name = f"episode_{len(lengths) - 1:08d}"
+        dataset_type = _decode_attr(h5_file["episode_00000000"].attrs["dataset_type"])
+        # Cheap guards against a merged multi-type file, whose episodes would get the wrong gripper conversion.
+        last_type = _decode_attr(h5_file[last_name].attrs["dataset_type"])
+        if last_type != dataset_type or h5_file[last_name]["state"].shape[0] != lengths[-1]:
+            raise ValueError(
+                f"{h5_file.filename} is not a single-type prepare_mem_tokenizer_h5.py output: "
+                f"first/last dataset_type {dataset_type!r}/{last_type!r}, last episode length "
+                f"{h5_file[last_name]['state'].shape[0]} vs episode_ends {lengths[-1]}"
+            )
+        return [
+            {"index": index, "name": f"episode_{index:08d}", "length": int(length), "dataset_type": dataset_type}
+            for index, length in enumerate(lengths)
+        ]
 
     def _ensure_open(self):
         if self._h5_file is None:
@@ -354,15 +366,20 @@ class H5MemTokenizerDataset(torch.utils.data.Dataset):
         }
 
     def _pre_calculate_sampling_indices(self):
-        for global_index, (episode_index, local_index) in enumerate(self._global_to_local):
-            rng = np.random.RandomState(global_index)
-            stride = int(rng.randint(self._stride_range[0], self._stride_range[1] + 1))
-            episode_len = self._episodes[episode_index]["length"]
-            if local_index < (self._history_seq_len - 1) * stride:
-                continue
-            if local_index + self._action_horizon * 0.75 > episode_len:
-                continue
-            self._valid_samples.append((global_index, episode_index, local_index, stride))
+        # One vectorized stride draw for all frames (fixed seed, storage order): a per-frame
+        # RandomState(global_index) took ~20 min on a busy node for 2.6M frames.
+        lengths = np.asarray([episode["length"] for episode in self._episodes], dtype=np.int64)
+        episode_index = np.repeat(np.arange(len(lengths)), lengths)
+        local_index = np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+        episode_len = lengths[episode_index]
+        stride = np.random.default_rng(0).integers(
+            self._stride_range[0], self._stride_range[1] + 1, size=len(local_index)
+        )
+        valid = (local_index >= (self._history_seq_len - 1) * stride) & (
+            local_index + self._action_horizon * 0.75 <= episode_len
+        )
+        global_index = np.arange(len(local_index))
+        self._valid_samples = np.stack([global_index, episode_index, local_index, stride], axis=1)[valid]
 
     def __len__(self) -> int:
         return len(self._valid_samples)
@@ -379,7 +396,7 @@ class H5MemTokenizerDataset(torch.utils.data.Dataset):
         return image
 
     def __getitem__(self, index: int) -> dict:
-        global_index, episode_index, local_index, stride = self._valid_samples[index]
+        global_index, episode_index, local_index, stride = (int(value) for value in self._valid_samples[index])
         episode = self._get_episode_data(episode_index)
 
         history_indices = [0]
@@ -422,6 +439,7 @@ class H5MemTokenizerDataset(torch.utils.data.Dataset):
             "actions": action_slice,
             "prompt": prompt,
             "dataset_type": self._episodes[episode_index]["dataset_type"],
+            "norm_key": self._norm_key,
         }
 
 
@@ -478,13 +496,19 @@ def create_mem_tokenizer_data_loader(
     if data_config.repo_id == "fake":
         dataset = FakeDataset(config.model, num_samples=1024)
     else:
-        dataset = H5MemTokenizerDataset(
-            data_config.repo_id,
-            history_seq_len=data_config.history_seq_len,
-            action_horizon=config.model.action_horizon,
-            stride_range=data_config.stride_range,
-            load_in_memory=data_config.load_in_memory,
-            default_prompt=data_config.default_prompt,
+        dataset = torch.utils.data.ConcatDataset(
+            [
+                H5MemTokenizerDataset(
+                    h5_dataset.path,
+                    history_seq_len=data_config.history_seq_len,
+                    action_horizon=config.model.action_horizon,
+                    stride_range=data_config.stride_range,
+                    load_in_memory=data_config.load_in_memory,
+                    default_prompt=data_config.default_prompt,
+                    norm_key=h5_dataset.path,
+                )
+                for h5_dataset in data_config.h5_datasets
+            ]
         )
     dataset = TransformedDataset(dataset, data_config.transforms)
 

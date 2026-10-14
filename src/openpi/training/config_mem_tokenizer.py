@@ -88,6 +88,11 @@ _CONFIGS = [
         ),
         freeze_filter=_model_default.get_freeze_filter(),
         data=temporal_data.H5MemTokenizerDataConfig(
+            repo_id="h5_datasets",
+            datasets=(
+                temporal_data.H5Dataset(path="data/sim.h5", norm_stats_dir="assets/sim"),
+                # temporal_data.H5Dataset(path="data/arx.h5", norm_stats_dir="assets/arx"),
+            ),
             load_in_memory=False,
             history_seq_len=_model_default.history_seq_len,
             stride_range=(8, 16),

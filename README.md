@@ -5,9 +5,6 @@
   <a href="https://arxiv.org/abs/2607.06678"><img src="https://img.shields.io/badge/arXiv-2607.06678-b31b1b" alt="arXiv"></a>
 </div>
 
-> [!WARNING]
-> This repository is a work-in-progress public code release. The code is being cleaned and validated, so APIs, configuration names, preprocessing scripts, and training commands may still change.
-
 NativeMEM equips a pretrained vision-language-action (VLA) policy with long-term, real-time-updated visual memory. Its Native Memory Compression scheme repurposes the VLA's own vision encoder to compress each historical frame-view observation into a single native memory token, then appends those tokens to the VLA's original input sequence.
 
 This repository retains the upstream `openpi` Python package namespace for compatibility with the underlying model, training, and policy infrastructure.
@@ -37,50 +34,56 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 export HF_LEROBOT_HOME=$(pwd)/data
 ```
 
+## Released checkpoints
+
+Checkpoints are hosted at [Ziyeeee/NativeMEM](https://huggingface.co/Ziyeeee/NativeMEM/tree/main) with the same layout as this repository:
+
+| Checkpoint | Path |
+| --- | --- |
+| Stage 1 pretrained memory tokenizer | `checkpoints/mem_tokenizer_pretrain/pretrain/49999/params` |
+| Stage 2 task-specific NativeMEM policies | `checkpoints/nativemem_pi05/<task>/19999` |
+
+Each Stage 2 checkpoint contains `params` and `assets`; the normalization statistics in `assets` are reloaded at evaluation.
+
+```bash
+hf download Ziyeeee/NativeMEM --include "checkpoints/mem_tokenizer_pretrain/pretrain/*" --local-dir .
+hf download Ziyeeee/NativeMEM --include "checkpoints/nativemem_pi05/*" --local-dir .
+```
+
+With the Stage 1 checkpoint downloaded, Stage 1 training can be skipped: pass `checkpoints/mem_tokenizer_pretrain/pretrain/49999/params`.
+
 ## Prepare the data
 
-### 1. Convert raw episodes to Stage 1 HDF5
+All commands assume raw and converted datasets live under `data/` and normalization statistics under `assets/<dataset type>/norm_stats.json`.
 
-Prepare RoboTwin/RMBench-style raw HDF5 episodes for memory-tokenizer training:
+### 1. Convert raw episodes to Stage 1 HDF5 and compute normalization assets
+
+List the raw RoboTwin/RMBench-style `.../data` directories in a JSON file under one dataset type (`sim`, `trossen`, or `arx`); glob patterns are expanded:
+
+```json
+{"sim": ["data/RMBench/*/demo_clean/data"]}
+```
+
+One run writes all episodes into one HDF5 file and its normalization statistics to `<assets_dir>/<output stem>/norm_stats.json`:
 
 ```bash
 python scripts/prepare_mem_tokenizer_h5.py \
-    --dataset_dir /path/to/task_a/demo/data /path/to/task_b/demo/data \
-    --output_path /path/to/sim_all.h5 \
-    --dataset_type sim
+    --sources data/sources.json \
+    --output_path data/sim.h5 \
+    --assets_dir assets             # -> assets/sim/norm_stats.json
 ```
 
-Supported dataset types are `sim`, `trossen`, and `arx`. Each output episode contains three camera streams, state, action, instructions, and a `dataset_type` attribute. When instruction JSON files are unavailable, provide fallback text with `--instruction_map`, repeated `--default_instruction TASK=TEXT`, or `--fallback_instruction`.
+Build one file per dataset type. Each output episode contains three JPEG camera streams, state, action, its instruction list (from `<task>/<demo>/instructions/episode<N>.json`), and a `dataset_type` attribute. When instruction JSON files are unavailable, provide fallback text with `--instruction_map`, repeated `--default_instruction TASK=TEXT`, or `--fallback_instruction`. The file is built in RAM and written once on close, so the host needs RAM for the whole output.
 
-For a large task collection, `--dataset_manifest` accepts a text file containing one raw data directory per line.
+### 2. List the datasets in the training config
 
-### 2. Merge prepared shards
+Set `datasets` of `mem_tokenizer_pretrain` in `src/openpi/training/config_mem_tokenizer.py`; each sample is normalized with the stats of the file it came from:
 
-Merge separately prepared datasets into one Stage 1 training file:
-
-```bash
-python scripts/merge_mem_tokenizer_h5.py \
-    --input_path /path/to/sim_all.h5 --dataset_type sim \
-    --input_path /path/to/arx_all.h5 --dataset_type arx \
-    --output_path /path/to/train.h5
-```
-
-Pass `--dataset_type` once for each input. It may be omitted when the type can be inferred from a filename such as `sim_all.h5` or from the episode attributes.
-
-### 3. Compute normalization assets
-
-Compute normalization statistics for every dataset type used in Stage 1. Store each result under `assets/<dataset_type>` so the loader can select the correct statistics per episode.
-
-```bash
-python scripts/compute_norm_stats_h5.py \
-    --h5-path /path/to/sim_all.h5 \
-    --output-dir assets/sim \
-    --gripper-type sim
-
-python scripts/compute_norm_stats_h5.py \
-    --h5-path /path/to/arx_all.h5 \
-    --output-dir assets/arx \
-    --gripper-type arx
+```python
+datasets=(
+    temporal_data.H5Dataset(path="data/sim.h5", norm_stats_dir="assets/sim"),
+    temporal_data.H5Dataset(path="data/arx.h5", norm_stats_dir="assets/arx"),
+),
 ```
 
 ## Stage 1: Train the memory tokenizer
@@ -88,23 +91,22 @@ python scripts/compute_norm_stats_h5.py \
 ```bash
 python scripts/train_mem_tokenizer.py mem_tokenizer_pretrain \
     --exp_name=my_mem_tokenizer \
-    --data.repo_id=/path/to/train.h5 \
     --overwrite
 ```
 
 ## Stage 1.5: Extract memory tokens
 
-Convert each task HDF5 file to a LeRobot dataset and extract one `mem_token` per frame-view pair with the trained memory tokenizer:
+Convert the raw episodes of each target task directly to a LeRobot dataset, extracting one `mem_token` per frame-view pair with the trained memory tokenizer:
 
 ```bash
-python examples/robotwin/convert_h5_to_lerobot_mem_tokenizer.py \
-    --data_path /path/to/task_name.h5 \
-    --repo_id task_name_nativemem \
+python examples/robotwin/convert_raw_to_lerobot_mem_tokenizer.py \
+    --data_dirs "data/RMBench/click_button/demo_clean/data" \
+    --repo_id click_button_nativemem \
     --params_path checkpoints/mem_tokenizer_pretrain/my_mem_tokenizer/49999/params \
-    --instruction "task description"
+    --episode_num 50
 ```
 
-The converter uses episode-level `instructions` when present; `--instruction` is the fallback. The resulting LeRobot dataset is stored under `$HF_LEROBOT_HOME/<repo_id>`.
+Frames go through the same resize-with-pad and JPEG round trip as the Stage 1 HDF5, so the cached tokens see the same pixels as tokenizer training. `--episode_num` keeps the first N episodes (by episode id) of each data directory. Instructions are read as in Stage 1 data preparation, with the same `--instruction_map`, `--default_instruction`, and `--fallback_instruction` fallbacks. The resulting LeRobot dataset is stored under `$HF_LEROBOT_HOME/<repo_id>`, i.e. `data/<repo_id>`.
 
 ## Stage 2: Train NativeMEM
 
@@ -116,7 +118,7 @@ weight_loader=weight_loaders.NativeMEMWeightLoader(
 )
 ```
 
-The provided `nativemem_pi05` config targets simulated ALOHA data: it uses `gripper_type="sim"` and loads normalization statistics from `assets/sim`. When training another robot type, update both the gripper type and normalization asset ID in the same config.
+The provided `nativemem_pi05` config targets simulated ALOHA data: it uses `gripper_type="sim"` and loads the normalization statistics written by data preparation step 1 from `assets/sim`. When training another robot type, update both the gripper type and normalization asset ID in the same config.
 
 The same config maps `repo_id` prefixes to the maximum flattened memory length. Add a task prefix to `REPO_ID_MEMORY_MAX_LEN` when the dataset needs a value other than the model default. The first matching prefix wins.
 
@@ -125,7 +127,7 @@ Then launch Stage 2:
 ```bash
 python scripts/train_nativemem.py nativemem_pi05 \
     --exp_name=my_nativemem \
-    --data.repo_id=task_name_nativemem \
+    --data.repo_id=click_button_nativemem \
     --overwrite
 ```
 
@@ -133,11 +135,11 @@ python scripts/train_nativemem.py nativemem_pi05 \
 ## Repository layout
 
 ```text
-scripts/prepare_mem_tokenizer_h5.py                         # Raw data -> Stage 1 HDF5
+scripts/prepare_mem_tokenizer_h5.py                         # Raw data -> Stage 1 HDF5 + norm stats
 scripts/merge_mem_tokenizer_h5.py                           # Merge Stage 1 HDF5 shards
 scripts/compute_norm_stats_h5.py                            # Compute HDF5 normalization statistics
 scripts/train_mem_tokenizer.py                              # Stage 1 training entry point
-examples/robotwin/convert_h5_to_lerobot_mem_tokenizer.py    # Cache mem_token features in LeRobot
+examples/robotwin/convert_raw_to_lerobot_mem_tokenizer.py    # Raw data -> LeRobot with cached mem_token
 scripts/train_nativemem.py                                  # Stage 2 training entry point
 src/openpi/models/mem_tokenizer.py                          # Memory-tokenizer model
 src/openpi/models/nativemem.py                              # NativeMEM policy model

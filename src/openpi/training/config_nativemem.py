@@ -32,6 +32,7 @@ REPO_ID_MEMORY_MAX_LEN: dict[str, int] = {
     "put_back_block": 256,
     "observe_and_pickup": 256,
     "swap_blocks": 256,
+    "swap_T": 256,
     "rearrange_blocks": 256,
     "cover_blocks": 512,
     "arx/click_button": 256,
