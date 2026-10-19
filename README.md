@@ -3,11 +3,18 @@
 <div id="top" align="left">
   <a href="https://opendrivelab.com/NativeMEM"><img src="https://img.shields.io/badge/Project-Page-blue" alt="Project Page"></a>
   <a href="https://arxiv.org/abs/2607.06678"><img src="https://img.shields.io/badge/arXiv-2607.06678-b31b1b" alt="arXiv"></a>
+  <a href="https://github.com/Ziyeeee/NativeMEM-RMBench"><img src="https://img.shields.io/badge/GitHub-NativeMEM--RMBench-black" alt="Simulation Evaluation"></a>
 </div>
+
+<p align="center">
+  <a href="assets/method.png"><img src="assets/method.png" alt="NativeMEM method overview" width="100%"></a>
+</p>
 
 NativeMEM equips a pretrained vision-language-action (VLA) policy with long-term, real-time-updated visual memory. Its Native Memory Compression scheme repurposes the VLA's own vision encoder to compress each historical frame-view observation into a single native memory token, then appends those tokens to the VLA's original input sequence.
 
 This repository retains the upstream `openpi` Python package namespace for compatibility with the underlying model, training, and policy infrastructure.
+
+The simulation evaluation lives in [NativeMEM-RMBench](https://github.com/Ziyeeee/NativeMEM-RMBench), which contains the memory-dependent manipulation tasks and a server-client evaluation mode for the NativeMEM policy. See that repository for more details.
 
 ## Method overview
 
